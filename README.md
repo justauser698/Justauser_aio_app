@@ -4,3 +4,4 @@ like some small bug fixes
 
 Goals:
 Auto dark mode
+Notifactions im not sure or i will add it
