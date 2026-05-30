@@ -18,12 +18,10 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -34,7 +32,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -144,6 +141,7 @@ fun EvilboiappApp() {
                     }
                 }
                 webChromeClient = WebChromeClient()
+                @Suppress("SetJavaScriptEnabled")
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
@@ -155,8 +153,10 @@ fun EvilboiappApp() {
                     javaScriptCanOpenWindowsAutomatically = true
                     setSupportMultipleWindows(false) // Better stability for Instagram/YouTube
 
-                    // High-compatibility Modern Mobile User Agent that works from Android 12 to 17+
-                    userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
+                    // Chrome-like User Agent that triggers dark mode on Google, YouTube, and Instagram
+                    // Added a specific version and platform that Google Search honors for dark mode
+                    // noinspection SpellCheckingInspection
+                    userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                 }
                 applyTheme(isDark)
                 loadUrl(destination.url)
@@ -177,7 +177,10 @@ fun EvilboiappApp() {
 
     // Sync theme
     LaunchedEffect(isDark) {
-        webViews.values.forEach { it.applyTheme(isDark) }
+        webViews.values.forEach { 
+            it.applyTheme(isDark)
+            it.reload()
+        }
     }
 
     NavigationSuiteScaffold(
@@ -277,12 +280,30 @@ private fun WebView.applyTheme(isDark: Boolean) {
     }
     
     // Use WebSettingsCompat for maximum compatibility across Android versions (Android 7 to 17)
+    // For Android 13 (Tiramisu) and above
     if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
         WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, isDark)
-    } else if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
+    }
+    
+    // For Android 10 to 12
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
         @Suppress("DEPRECATION")
         val forceDark = if (isDark) WebSettingsCompat.FORCE_DARK_ON else WebSettingsCompat.FORCE_DARK_OFF
+        @Suppress("DEPRECATION")
         WebSettingsCompat.setForceDark(settings, forceDark)
+    }
+
+    // "Real Browser" behavior: 
+    // This tells websites (Google/YouTube) to honor their dark media queries.
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK_STRATEGY)) {
+        @Suppress("DEPRECATION")
+        val strategy = if (isDark) {
+            WebSettingsCompat.DARK_STRATEGY_PREFER_WEB_THEME_OVER_USER_AGENT_DARKENING
+        } else {
+            WebSettingsCompat.DARK_STRATEGY_USER_AGENT_DARKENING_ONLY // Fallback for light mode
+        }
+        @Suppress("DEPRECATION")
+        WebSettingsCompat.setForceDarkStrategy(settings, strategy)
     }
 }
 
