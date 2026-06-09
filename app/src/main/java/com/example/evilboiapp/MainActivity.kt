@@ -11,6 +11,8 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.net.HttpURLConnection
+import java.net.URL
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -76,10 +78,11 @@ class MainActivity : ComponentActivity() {
 
 @PreviewScreenSizes
 @Composable
-fun EvilboiappApp() {
+fun EvilboiappApp(
+    isDark: Boolean = isSystemInDarkTheme()
+) {
     var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.WEB) }
     val context = LocalContext.current
-    val isDark = isSystemInDarkTheme()
     val focusManager = LocalFocusManager.current
 
     // Store the current URL for the browser bar
@@ -139,6 +142,83 @@ fun EvilboiappApp() {
                         }
                         return false
                     }
+
+                    // For API 33+ some pages run very early; intercept the main document and inject a small script
+                    // so prefers-color-scheme is present before page scripts execute.
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        try {
+                            if (request?.isForMainFrame == true) {
+                                val reqUrl = request.url?.toString() ?: return null
+                                if (!(reqUrl.startsWith("http://") || reqUrl.startsWith("https://"))) return null
+
+                                val url = URL(reqUrl)
+                                val conn = url.openConnection() as HttpURLConnection
+                                conn.requestMethod = "GET"
+                                conn.instanceFollowRedirects = true
+                                // copy User-Agent so servers return same HTML
+                                conn.setRequestProperty("User-Agent", settings.userAgentString ?: "")
+                                conn.connectTimeout = 5000
+                                conn.readTimeout = 5000
+
+                                val contentType = conn.contentType ?: ""
+                                val mime = contentType.substringBefore(';').trim().lowercase()
+
+                                if (mime != "text/html") {
+                                    return null
+                                }
+
+                                val charset = contentType.substringAfter("charset=", "utf-8")
+                                val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+
+                                // Build injection script reflecting the current theme stored in view.tag (updated when theme changes)
+                                val curDark = (view?.tag as? Boolean) ?: false
+                                val inject = """
+                                    <script>
+                                      (function(isDark){
+                                        try{
+                                          const origMatch = window.matchMedia.bind(window);
+                                          function createMQL(query){
+                                            const matches = query.indexOf('prefers-color-scheme') !== -1 && isDark === true;
+                                            const listeners = [];
+                                            const mql = {
+                                              matches: matches,
+                                              media: query,
+                                              onchange: null,
+                                              addListener: function(cb){ if(typeof cb === 'function') listeners.push(cb); },
+                                              removeListener: function(cb){ const i = listeners.indexOf(cb); if(i>-1) listeners.splice(i,1); },
+                                              addEventListener: function(type, cb){ if(type === 'change' && typeof cb === 'function') listeners.push(cb); },
+                                              removeEventListener: function(type, cb){ if(type === 'change'){ const i = listeners.indexOf(cb); if(i>-1) listeners.splice(i,1); } },
+                                              dispatchEvent: function(ev){ listeners.forEach(function(cb){ try{ cb(ev); }catch(e){} }); return true; }
+                                            };
+                                            return mql;
+                                          }
+                                          window.matchMedia = function(query){
+                                            if (query && query.indexOf('prefers-color-scheme') !== -1) {
+                                              return createMQL(query);
+                                            }
+                                            return origMatch(query);
+                                          };
+                                          try{ window.dispatchEvent(new Event('prefers-color-scheme-changed')); }catch(e){}
+                                        }catch(e){}
+                                      })(${curDark});
+                                    </script>
+                                """.trimIndent()
+
+                                // Insert before </head> when possible, else prepend
+                                val modified = if (body.contains("</head>", ignoreCase = true)) {
+                                    body.replaceFirst("</head>", "${inject}</head>")
+                                } else {
+                                    inject + body
+                                }
+
+                                val bytes = modified.toByteArray(Charsets.UTF_8)
+                                return android.webkit.WebResourceResponse("text/html", charset, java.io.ByteArrayInputStream(bytes))
+                            }
+                        } catch (_: Exception) {
+                            // best-effort; fall back to default handling
+                        }
+                        return null
+                    }
                 }
                 webChromeClient = WebChromeClient()
                 @Suppress("SetJavaScriptEnabled")
@@ -155,6 +235,7 @@ fun EvilboiappApp() {
 
                     // Chrome-like User Agent that triggers dark mode on Google, YouTube, and Instagram
                     // Added a specific version and platform that Google Search honors for dark mode
+                    // Also it dosent matter that is andrioid 13 it will work on older versions also
                     // noinspection SpellCheckingInspection
                     userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                 }
@@ -175,11 +256,23 @@ fun EvilboiappApp() {
         canGoBack = activeWebView?.canGoBack() == true
     }
 
-    // Sync theme
+    // Sync theme settings and refresh browser when it changes
     LaunchedEffect(isDark) {
-        webViews.values.forEach { 
-            it.applyTheme(isDark)
-            it.reload()
+        webViews.values.forEach { webView ->
+            webView.applyTheme(isDark)
+            // store current theme on the view so intercepted requests can use it
+            webView.tag = isDark
+            webView.injectPrefersColorScheme(isDark)
+            webView.post {
+                // Force a network reload so sites re-evaluate prefers-color-scheme
+                try {
+                    webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                    webView.clearCache(true)
+                    webView.reload()
+                } catch (_: Exception) {}
+                // Restore normal caching after reload
+                try { webView.settings.cacheMode = WebSettings.LOAD_DEFAULT } catch (_: Exception) {}
+            }
         }
     }
 
@@ -254,7 +347,14 @@ fun EvilboiappApp() {
                         }
                     }
 
-                    IconButton(onClick = { activeWebView?.reload() }) {
+                    IconButton(onClick = { activeWebView?.post {
+                        try { activeWebView.settings.cacheMode = WebSettings.LOAD_NO_CACHE } catch (_: Exception) {}
+                        try { activeWebView.clearCache(true) } catch (_: Exception) {}
+                        try { activeWebView.tag = isDark } catch (_: Exception) {}
+                        try { activeWebView.injectPrefersColorScheme(isDark) } catch (_: Exception) {}
+                        try { activeWebView.reload() } catch (_: Exception) {}
+                        try { activeWebView.settings.cacheMode = WebSettings.LOAD_DEFAULT } catch (_: Exception) {}
+                    } }) {
                         Icon(Icons.Default.Refresh, "Reload")
                     }
                 }
@@ -272,39 +372,75 @@ fun EvilboiappApp() {
 }
 
 private fun WebView.applyTheme(isDark: Boolean) {
-    // Set background to black in dark mode to avoid white flashes
-    if (isDark) {
-        setBackgroundColor(Color.BLACK)
-    } else {
-        setBackgroundColor(Color.WHITE)
-    }
-    
-    // Use WebSettingsCompat for maximum compatibility across Android versions (Android 7 to 17)
-    // For Android 13 (Tiramisu) and above
-    if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
-        WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, isDark)
-    }
-    
-    // For Android 10 to 12
-    if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
-        @Suppress("DEPRECATION")
-        val forceDark = if (isDark) WebSettingsCompat.FORCE_DARK_ON else WebSettingsCompat.FORCE_DARK_OFF
-        @Suppress("DEPRECATION")
-        WebSettingsCompat.setForceDark(settings, forceDark)
-    }
+    // Force background color to prevent theme bleeding
+    setBackgroundColor(if (isDark) Color.BLACK else Color.WHITE)
 
-    // "Real Browser" behavior: 
-    // This tells websites (Google/YouTube) to honor their dark media queries.
-    if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK_STRATEGY)) {
-        @Suppress("DEPRECATION")
-        val strategy = if (isDark) {
-            WebSettingsCompat.DARK_STRATEGY_PREFER_WEB_THEME_OVER_USER_AGENT_DARKENING
-        } else {
-            WebSettingsCompat.DARK_STRATEGY_USER_AGENT_DARKENING_ONLY // Fallback for light mode
+    // Use safe calls and guards so this runs on API 31..37 (and other runtimes)
+    try {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+            WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, isDark)
         }
-        @Suppress("DEPRECATION")
-        WebSettingsCompat.setForceDarkStrategy(settings, strategy)
-    }
+    } catch (_: Throwable) { /* best-effort */ }
+
+    try {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
+            @Suppress("DEPRECATION")
+            val forceDark = if (isDark) WebSettingsCompat.FORCE_DARK_ON else WebSettingsCompat.FORCE_DARK_OFF
+            @Suppress("DEPRECATION")
+            WebSettingsCompat.setForceDark(settings, forceDark)
+        }
+    } catch (_: Throwable) { /* best-effort */ }
+
+    try {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK_STRATEGY)) {
+            @Suppress("DEPRECATION")
+            val strategy = WebSettingsCompat.DARK_STRATEGY_PREFER_WEB_THEME_OVER_USER_AGENT_DARKENING
+            @Suppress("DEPRECATION")
+            WebSettingsCompat.setForceDarkStrategy(settings, strategy)
+        }
+    } catch (_: Throwable) { /* best-effort */ }
+}
+
+private fun WebView.injectPrefersColorScheme(isDark: Boolean) {
+    // More robust JS shim for window.matchMedia to help pages honour the spoofed system theme.
+    val boolStr = if (isDark) "true" else "false"
+    val js = """
+        (function(isDark){
+          try{
+            const origMatch = window.matchMedia.bind(window);
+
+            function createMQL(query){
+              const matches = query.indexOf('prefers-color-scheme') !== -1 && isDark === true;
+              const listeners = [];
+              const mql = {
+                matches: matches,
+                media: query,
+                onchange: null,
+                addListener: function(cb){ if(typeof cb === 'function') listeners.push(cb); },
+                removeListener: function(cb){ const i = listeners.indexOf(cb); if(i>-1) listeners.splice(i,1); },
+                addEventListener: function(type, cb){ if(type === 'change' && typeof cb === 'function') listeners.push(cb); },
+                removeEventListener: function(type, cb){ if(type === 'change'){ const i = listeners.indexOf(cb); if(i>-1) listeners.splice(i,1); } },
+                dispatchEvent: function(ev){ listeners.forEach(function(cb){ try{ cb(ev); }catch(e){} }); return true; }
+              };
+              return mql;
+            }
+
+            window.matchMedia = function(query){
+              if (query && query.indexOf('prefers-color-scheme') !== -1) {
+                return createMQL(query);
+              }
+              return origMatch(query);
+            };
+
+            // Notify any listeners on the document/window that theme changed
+            try{ window.dispatchEvent(new Event('prefers-color-scheme-changed')); }catch(e){}
+          }catch(e){}
+        })($boolStr);
+    """.trimIndent()
+
+    try {
+        post { evaluateJavascript(js, null) }
+    } catch (_: Throwable) { /* ignore */ }
 }
 
 enum class AppDestinations(
