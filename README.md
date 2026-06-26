@@ -7,4 +7,4 @@ Auto dark mode
 Notifactions im not sure or i will add it
 
 Issues that are known:
-Instagram dosent work well the playback
+Instagram dosent work well the playback dosent work
